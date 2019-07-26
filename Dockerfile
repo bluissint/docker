@@ -1,105 +1,75 @@
-FROM ubuntu:xenial
+FROM ubuntu:16.04
 
-# add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN groupadd -r mongodb && useradd -r -g mongodb mongodb
+MAINTAINER Couchbase Docker Team <docker@couchbase.com>
 
-RUN set -eux; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends \
-		ca-certificates \
-		jq \
-		numactl \
-	; \
-	if ! command -v ps > /dev/null; then \
-		apt-get install -y --no-install-recommends procps; \
-	fi; \
-	rm -rf /var/lib/apt/lists/*
+# Install dependencies:
+#  runit: for container process management
+#  wget: for downloading .deb
+#  chrpath: for fixing curl, below
+#  tzdata: timezone info used by some N1QL functions
+# Additional dependencies for system commands used by cbcollect_info:
+#  lsof: lsof
+#  lshw: lshw
+#  sysstat: iostat, sar, mpstat
+#  net-tools: ifconfig, arp, netstat
+#  numactl: numactl
+RUN apt-get update && \
+    apt-get install -yq runit wget chrpath tzdata \
+    lsof lshw sysstat net-tools numactl python-httplib2 && \
+    apt-get autoremove && apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# grab gosu for easy step-down from root (https://github.com/tianon/gosu/releases)
-ENV GOSU_VERSION 1.11
-# grab "js-yaml" for parsing mongod's YAML config files (https://github.com/nodeca/js-yaml/releases)
-ENV JSYAML_VERSION 3.13.0
+ARG CB_VERSION=6.0.2
+ARG CB_RELEASE_URL=https://packages.couchbase.com/releases/6.0.2
+ARG CB_PACKAGE=couchbase-server-enterprise_6.0.2-ubuntu16.04_amd64.deb
+ARG CB_SHA256=1a68803b191492986c21dc6a5abf3dd79d46212a18bb9c80a077fa9eaef5165c
 
-RUN set -ex; \
-	\
-	savedAptMark="$(apt-mark showmanual)"; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends \
-		wget \
-	; \
-	if ! command -v gpg > /dev/null; then \
-		apt-get install -y --no-install-recommends gnupg dirmngr; \
-		savedAptMark="$savedAptMark gnupg dirmngr"; \
-	elif gpg --version | grep -q '^gpg (GnuPG) 1\.'; then \
-# "This package provides support for HKPS keyservers." (GnuPG 1.x only)
-		apt-get install -y --no-install-recommends gnupg-curl; \
-	fi; \
-	rm -rf /var/lib/apt/lists/*; \
-	\
-	dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
-	wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
-	wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
-	gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu; \
-	command -v gpgconf && gpgconf --kill all || :; \
-	rm -r "$GNUPGHOME" /usr/local/bin/gosu.asc; \
-	chmod +x /usr/local/bin/gosu; \
-	gosu --version; \
-	gosu nobody true; \
-	\
-	wget -O /js-yaml.js "https://github.com/nodeca/js-yaml/raw/${JSYAML_VERSION}/dist/js-yaml.js"; \
-# TODO some sort of download verification here
-	\
-	apt-mark auto '.*' > /dev/null; \
-	apt-mark manual $savedAptMark > /dev/null; \
-	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false
+ENV PATH=$PATH:/opt/couchbase/bin:/opt/couchbase/bin/tools:/opt/couchbase/bin/install
 
-RUN mkdir /docker-entrypoint-initdb.d
+# Create Couchbase user with UID 1000 (necessary to match default
+# boot2docker UID)
+RUN groupadd -g 1000 couchbase && useradd couchbase -u 1000 -g couchbase -M
 
-ENV GPG_KEYS 0C49F3730359A14518585931BC711F9BA15703C6
-RUN set -ex; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	for key in $GPG_KEYS; do \
-		gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$key"; \
-	done; \
-	gpg --batch --export $GPG_KEYS > /etc/apt/trusted.gpg.d/mongodb.gpg; \
-	command -v gpgconf && gpgconf --kill all || :; \
-	rm -r "$GNUPGHOME"; \
-	apt-key list
+# Install couchbase
+RUN export INSTALL_DONT_START_SERVER=1 && \
+    wget -N --no-verbose $CB_RELEASE_URL/$CB_PACKAGE && \
+    echo "$CB_SHA256  $CB_PACKAGE" | sha256sum -c - && \
+    dpkg -i ./$CB_PACKAGE && rm -f ./$CB_PACKAGE
 
-# Allow build-time overrides (eg. to build image with MongoDB Enterprise version)
-# Options for MONGO_PACKAGE: mongodb-org OR mongodb-enterprise
-# Options for MONGO_REPO: repo.mongodb.org OR repo.mongodb.com
-# Example: docker build --build-arg MONGO_PACKAGE=mongodb-enterprise --build-arg MONGO_REPO=repo.mongodb.com .
-ARG MONGO_PACKAGE=mongodb-org
-ARG MONGO_REPO=repo.mongodb.org
-ENV MONGO_PACKAGE=${MONGO_PACKAGE} MONGO_REPO=${MONGO_REPO}
+# Add runit script for couchbase-server
+COPY scripts/run /etc/service/couchbase-server/run
+RUN chown -R couchbase:couchbase /etc/service
 
-ENV MONGO_MAJOR 3.4
-ENV MONGO_VERSION 3.4.21
-# bashbrew-architectures:amd64 arm64v8
-RUN echo "deb http://$MONGO_REPO/apt/ubuntu xenial/${MONGO_PACKAGE%-unstable}/$MONGO_MAJOR multiverse" | tee "/etc/apt/sources.list.d/${MONGO_PACKAGE%-unstable}.list"
+# Add dummy script for commands invoked by cbcollect_info that
+# make no sense in a Docker container
+COPY scripts/dummy.sh /usr/local/bin/
+RUN ln -s dummy.sh /usr/local/bin/iptables-save && \
+    ln -s dummy.sh /usr/local/bin/lvdisplay && \
+    ln -s dummy.sh /usr/local/bin/vgdisplay && \
+    ln -s dummy.sh /usr/local/bin/pvdisplay
 
-RUN set -x \
-	&& apt-get update \
-	&& apt-get install -y \
-		${MONGO_PACKAGE}=$MONGO_VERSION \
-		${MONGO_PACKAGE}-server=$MONGO_VERSION \
-		${MONGO_PACKAGE}-shell=$MONGO_VERSION \
-		${MONGO_PACKAGE}-mongos=$MONGO_VERSION \
-		${MONGO_PACKAGE}-tools=$MONGO_VERSION \
-	&& rm -rf /var/lib/apt/lists/* \
-	&& rm -rf /var/lib/mongodb \
-	&& mv /etc/mongod.conf /etc/mongod.conf.orig
+# Fix curl RPATH
+RUN chrpath -r '$ORIGIN/../lib' /opt/couchbase/bin/curl
 
-RUN mkdir -p /data/db /data/configdb \
-	&& chown -R mongodb:mongodb /data/db /data/configdb
-VOLUME /data/db /data/configdb
+# Add bootstrap script
+COPY scripts/entrypoint.sh /
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["couchbase-server"]
 
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN ln -s usr/local/bin/docker-entrypoint.sh /entrypoint.sh # backwards compat (3.4)
-ENTRYPOINT ["docker-entrypoint.sh"]
-
-EXPOSE 27017
-CMD ["mongod"]
+# 8091: Couchbase Web console, REST/HTTP interface
+# 8092: Views, queries, XDCR
+# 8093: Query services (4.0+)
+# 8094: Full-text Search (4.5+)
+# 8095: Analytics (5.5+)
+# 8096: Eventing (5.5+)
+# 11207: Smart client library data node access (SSL)
+# 11210: Smart client library/moxi data node access
+# 11211: Legacy non-smart client library data node access
+# 18091: Couchbase Web console, REST/HTTP interface (SSL)
+# 18092: Views, query, XDCR (SSL)
+# 18093: Query services (SSL) (4.0+)
+# 18094: Full-text Search (SSL) (4.5+)
+# 18095: Analytics (SSL) (5.5+)
+# 18096: Eventing (SSL) (5.5+)
+EXPOSE 8091 8092 8093 8094 8095 8096 11207 11210 11211 18091 18092 18093 18094 18095 18096
+VOLUME /opt/couchbase/var
